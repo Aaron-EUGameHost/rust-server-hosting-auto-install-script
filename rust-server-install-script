@@ -1,0 +1,935 @@
+#!/bin/bash
+#
+# Install Rust Dedicated Server
+#
+# Uses Glorious Eggroll's build of Proton
+# Please ensure to run this script as root (or at least with sudo)
+#
+# @LICENSE AGPLv3
+# @AUTHOR  Adapted from ARK installer by Charlie Powell
+# @CATEGORY Game Server
+# @TRMM-TIMEOUT 600
+#
+# Supports:
+#   Debian 12
+#   Ubuntu 24.04
+#
+# Requirements:
+#   None
+#
+# Syntax:
+#   --reset-proton - Reset proton directories back to default
+#   --force-reinstall - Force a reinstall of the game binaries and engine
+#
+# Changelog:
+#   20250723 - Initial Rust adaptation from ARK installer
+#
+
+############################################
+## Parameter Configuration
+############################################
+
+# https://github.com/GloriousEggroll/proton-ge-custom
+PROTON_VERSION="9-22"
+GAME="RustDedicated"
+GAME_USER="steam"
+GAME_DIR="/home/$GAME_USER/$GAME"
+# Force installation directory for game
+STEAM_DIR="/home/$GAME_USER/.local/share/Steam"
+# Specific "filesystem" directory for installed version of Proton
+GAME_COMPAT_DIR="/opt/script-collection/GE-Proton${PROTON_VERSION}/files/share/default_pfx"
+# Binary path for Proton
+PROTON_BIN="/opt/script-collection/GE-Proton${PROTON_VERSION}/proton"
+# Steam ID of the game
+STEAM_ID="258550"
+# Rust server instance name
+RUST_SERVER="rust-server"
+# Default ports for Rust
+PORT_GAME=28015
+PORT_RCON=28016
+PORT_QUERY=28017
+
+# Parse arguments
+OPT_RESET_PROTON=0
+OPT_FORCE_REINSTALL=0
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		--reset-proton) OPT_RESET_PROTON=1; shift 1;;
+		--force-reinstall) OPT_FORCE_REINSTALL=1; shift 1;;
+	esac
+done
+
+##
+# Simple check to enforce the script to be run as root
+if [ $(id -u) -ne 0 ]; then
+	echo "This script must be run as root or with sudo!" >&2
+	exit 1
+fi
+
+##
+# Install Glorious Eggroll's Proton fork on a requested version
+#
+# https://github.com/GloriousEggroll/proton-ge-custom
+#
+# Will install Proton into /opt/script-collection/GE-Proton${VERSION}
+# with its pfx directory in /opt/script-collection/GE-Proton${VERSION}/files/share/default_pfx
+#
+# @arg $1 string Proton version to install
+function install_proton() {
+	VERSION="${1:-9-21}"
+
+	echo "Installing Glorious Eggroll's Proton $VERSION..."
+
+	PROTON_URL="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton${VERSION}/GE-Proton${VERSION}.tar.gz"
+	PROTON_TGZ="$(basename "$PROTON_URL")"
+	PROTON_NAME="$(basename "$PROTON_TGZ" ".tar.gz")"
+
+	# We will use this directory as a working directory for source files that need downloaded.
+	[ -d /opt/script-collection ] || mkdir -p /opt/script-collection
+
+	# Grab Proton from Glorious Eggroll
+	if [ ! -e "/opt/script-collection/$PROTON_TGZ" ]; then
+		wget "$PROTON_URL" -O "/opt/script-collection/$PROTON_TGZ"
+	fi
+	# Extract GE Proton into /opt
+	if [ ! -e "/opt/script-collection/$PROTON_NAME" ]; then
+		tar -x -C /opt/script-collection/ -f "/opt/script-collection/$PROTON_TGZ"
+	fi
+}
+
+##
+# Get which firewall is enabled,
+# or "none" if none located
+function get_enabled_firewall() {
+	if [ "$(systemctl is-active firewalld)" == "active" ]; then
+		echo "firewalld"
+	elif [ "$(systemctl is-active ufw)" == "active" ]; then
+		echo "ufw"
+	elif [ "$(systemctl is-active iptables)" == "active" ]; then
+		echo "iptables"
+	else
+		echo "none"
+	fi
+}
+
+##
+# Get which firewall is available on the local system,
+# or "none" if none located
+function get_available_firewall() {
+	if systemctl list-unit-files firewalld.service &>/dev/null; then
+		echo "firewalld"
+	elif systemctl list-unit-files ufw.service &>/dev/null; then
+		echo "ufw"
+	elif systemctl list-unit-files iptables.service &>/dev/null; then
+		echo "iptables"
+	else
+		echo "none"
+	fi
+}
+
+##
+# Check if the OS is "like" a certain type
+function os_like_debian() {
+	if [ -f '/etc/os-release' ]; then
+		ID="$(egrep '^ID=' /etc/os-release | sed 's:ID=::')"
+		LIKE="$(egrep '^ID_LIKE=' /etc/os-release | sed 's:ID_LIKE=::')"
+
+		if [[ "$LIKE" =~ 'debian' ]]; then echo 1; return; fi
+		if [[ "$LIKE" =~ 'ubuntu' ]]; then echo 1; return; fi
+		if [ "$ID" == 'debian' ]; then echo 1; return; fi
+		if [ "$ID" == 'ubuntu' ]; then echo 1; return; fi
+	fi
+
+	echo 0
+}
+
+##
+# Check if the OS is "like" a certain type
+function os_like_ubuntu() {
+	if [ -f '/etc/os-release' ]; then
+		ID="$(egrep '^ID=' /etc/os-release | sed 's:ID=::')"
+		LIKE="$(egrep '^ID_LIKE=' /etc/os-release | sed 's:ID_LIKE=::')"
+
+		if [[ "$LIKE" =~ 'ubuntu' ]]; then echo 1; return; fi
+		if [ "$ID" == 'ubuntu' ]; then echo 1; return; fi
+	fi
+
+	echo 0
+}
+
+##
+# Check if the OS is "like" a certain type
+function os_like_rhel() {
+	if [ -f '/etc/os-release' ]; then
+		ID="$(egrep '^ID=' /etc/os-release | sed 's:ID=::')"
+		LIKE="$(egrep '^ID_LIKE=' /etc/os-release | sed 's:ID_LIKE=::')"
+
+		if [[ "$LIKE" =~ 'rhel' ]]; then echo 1; return; fi
+		if [[ "$LIKE" =~ 'fedora' ]]; then echo 1; return; fi
+		if [[ "$LIKE" =~ 'centos' ]]; then echo 1; return; fi
+		if [ "$ID" == 'rhel' ]; then echo 1; return; fi
+		if [ "$ID" == 'fedora' ]; then echo 1; return; fi
+		if [ "$ID" == 'centos' ]; then echo 1; return; fi
+	fi
+
+	echo 0
+}
+
+##
+# Install SteamCMD
+function install_steamcmd() {
+	echo "Installing SteamCMD..."
+
+	TYPE_DEBIAN="$(os_like_debian)"
+	TYPE_UBUNTU="$(os_like_ubuntu)"
+
+	# Preliminary requirements
+	if [ "$TYPE_UBUNTU" == 1 ]; then
+		add-apt-repository -y multiverse
+		dpkg --add-architecture i386
+		apt update
+
+		# By using this script, you agree to the Steam license agreement
+		echo steam steam/question select "I AGREE" | debconf-set-selections
+		echo steam steam/license note '' | debconf-set-selections
+
+		apt install -y steamcmd
+	elif [ "$TYPE_DEBIAN" == 1 ]; then
+		dpkg --add-architecture i386
+		apt update
+		apt install -y software-properties-common apt-transport-https dirmngr ca-certificates lib32gcc-s1
+
+		# Enable "non-free" repos for Debian (for steamcmd)
+		add-apt-repository -y -U http://deb.debian.org/debian -c non-free-firmware -c non-free
+		if [ $? -ne 0 ]; then
+			echo "Workaround failed to add non-free repos, trying new method instead"
+			apt-add-repository -y non-free
+		fi
+
+		# Install steam repo
+		curl -s http://repo.steampowered.com/steam/archive/stable/steam.gpg > /usr/share/keyrings/steam.gpg
+		echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/steam.gpg] http://repo.steampowered.com/steam/ stable steam" > /etc/apt/sources.list.d/steam.list
+
+		# By using this script, you agree to the Steam license agreement
+		echo steam steam/question select "I AGREE" | debconf-set-selections
+		echo steam steam/license note '' | debconf-set-selections
+
+		# Install steam binary and steamcmd
+		apt update
+		apt install -y steamcmd
+	else
+		echo 'Unsupported or unknown OS' >&2
+		exit 1
+	fi
+}
+
+##
+# Install a package with the system's package manager.
+function package_install (){
+	echo "package_install: Installing $*..."
+
+	TYPE_DEBIAN="$(os_like_debian)"
+	TYPE_RHEL="$(os_like_rhel)"
+
+	if [ "$TYPE_DEBIAN" == 1 ]; then
+		apt-get -o Dpkg::Options::="--force-confold" -o Dpkg::Options::="--force-confdef" install -y $*
+	elif [ "$TYPE_RHEL" == 1 ]; then
+		yum install -y $*
+	else
+		echo 'package_install: Unsupported or unknown OS' >&2
+		exit 1
+	fi
+}
+
+##
+# Install UFW
+function install_ufw() {
+	if [ "$(os_like_rhel)" == 1 ]; then
+		# RHEL/CentOS requires EPEL to be installed first
+		package_install epel-release
+	fi
+
+	package_install ufw
+
+	# Auto-enable a newly installed firewall
+	ufw --force enable
+	systemctl enable ufw
+	systemctl start ufw
+
+	# Auto-add the current user's remote IP to the whitelist (anti-lockout rule)
+	local TTY_IP="$(who am i | awk '{print $5}' | sed 's/[()]//g')"
+	if [ -n "$TTY_IP" ]; then
+		ufw allow from $TTY_IP comment 'Anti-lockout rule based on first install of UFW'
+	fi
+}
+
+##
+# Add an "allow" rule to the firewall
+function firewall_allow() {
+	# Defaults and argument processing
+	local PORT=""
+	local PROTO="tcp"
+	local SOURCE="any"
+	local FIREWALL=$(get_available_firewall)
+	local ZONE="public"
+	local COMMENT=""
+	while [ $# -ge 1 ]; do
+		case $1 in
+			--port)
+				shift
+				PORT=$1
+				;;
+			--tcp|--udp)
+				PROTO=${1:2}
+				;;
+			--source|--from)
+				shift
+				SOURCE=$1
+				;;
+			--zone)
+				shift
+				ZONE=$1
+				;;
+			--comment)
+				shift
+				COMMENT=$1
+				;;
+			*)
+				PORT=$1
+				;;
+		esac
+		shift
+	done
+
+	if [ "$PORT" == "" -a "$ZONE" != "trusted" ]; then
+		echo "firewall_allow: No port specified!" >&2
+		exit 1
+	fi
+
+	if [ "$FIREWALL" == "ufw" ]; then
+		if [ "$SOURCE" == "any" ]; then
+			echo "firewall_allow/UFW: Allowing $PORT/$PROTO from any..."
+			ufw allow proto $PROTO to any port $PORT comment "$COMMENT"
+		else
+			echo "firewall_allow/UFW: Allowing $PORT/$PROTO from $SOURCE..."
+			ufw allow from $SOURCE proto $PROTO to any port $PORT comment "$COMMENT"
+		fi
+	elif [ "$FIREWALL" == "firewalld" ]; then
+		if [ "$SOURCE" != "any" ]; then
+			echo "firewall_allow/firewalld: Adding $SOURCE to $ZONE zone..."
+			firewall-cmd --zone=$ZONE --add-source=$SOURCE --permanent
+		fi
+
+		if [ "$PORT" != "" ]; then
+			echo "firewall_allow/firewalld: Allowing $PORT/$PROTO in $ZONE zone..."
+			firewall-cmd --zone=$ZONE --add-port=$PORT/$PROTO --permanent
+		fi
+
+		firewall-cmd --reload
+	elif [ "$FIREWALL" == "none" ]; then
+		echo "firewall_allow: No firewall detected" >&2
+		exit 1
+	else
+		echo "firewall_allow: Unsupported or unknown firewall" >&2
+		exit 1
+	fi
+}
+
+##
+# Generate a random password
+function random_password() {
+	< /dev/urandom tr -dc _cdefhjkmnprtvwxyACDEFGHJKLMNPQRTUVWXY2345689 | head -c${1:-24};echo;
+}
+
+############################################
+## Pre-exec Checks
+############################################
+
+# Check if server is running
+RUNNING=0
+if [ "$(systemctl is-active $RUST_SERVER)" == "active" ]; then
+	RUNNING=1
+fi
+
+if [ $RUNNING -eq 1 -a $OPT_RESET_PROTON -eq 1 ]; then
+	echo "Rust server is still running, force reinstallation CAN NOT PROCEED"
+	exit 1
+fi
+
+if [ $RUNNING -eq 1 -a $OPT_FORCE_REINSTALL -eq 1 ]; then
+	echo "Rust server is still running, force reinstallation CAN NOT PROCEED"
+	exit 1
+fi
+
+# Determine if this is a new installation or an upgrade
+if [ -e /etc/systemd/system/rust-server.service ]; then
+	INSTALLTYPE="upgrade"
+else
+	INSTALLTYPE="new"
+fi
+
+############################################
+## User Prompts (pre setup)
+############################################
+
+echo "================================================================================"
+echo "              Rust Dedicated Server *unofficial* Installer"
+echo ""
+if [ "$INSTALLTYPE" == "new" ]; then
+	echo "? What is the name of the server? (e.g. My Awesome Rust Server)"
+	echo -n "> "
+	read SERVERNAME
+	if [ "$SERVERNAME" == "" ]; then
+		SERVERNAME="My Awesome Rust Server"
+	fi
+
+	echo ""
+	echo "? What is the server description?"
+	echo -n "> "
+	read SERVERDESC
+	if [ "$SERVERDESC" == "" ]; then
+		SERVERDESC="A Rust server running on Linux"
+	fi
+
+	echo ""
+	echo "? What is the world size? (1000-4000, default 3000)"
+	echo -n "> "
+	read WORLDSIZE
+	if [ "$WORLDSIZE" == "" ]; then
+		WORLDSIZE="3000"
+	fi
+
+	echo ""
+	echo "? What is the max players? (default 50)"
+	echo -n "> "
+	read MAXPLAYERS
+	if [ "$MAXPLAYERS" == "" ]; then
+		MAXPLAYERS="50"
+	fi
+
+	echo ""
+	echo "? Enable PvE mode? (y/N)"
+	echo -n "> "
+	read PVE_MODE
+	if [ "$PVE_MODE" == "y" -o "$PVE_MODE" == "Y" ]; then
+		PVE_MODE=1
+	else
+		PVE_MODE=0
+	fi
+fi
+
+############################################
+## Dependency Installation and Setup
+############################################
+
+# Create a "steam" user account
+if [ -z "$(getent passwd $GAME_USER)" ]; then
+	useradd -m -U $GAME_USER
+fi
+
+# Setup the ssh directory for the steam user
+[ -d "/home/$GAME_USER/.ssh" ] || mkdir -p "/home/$GAME_USER/.ssh"
+[ -e "/home/$GAME_USER/.ssh/authorized_keys" ] || touch "/home/$GAME_USER/.ssh/authorized_keys"
+chown -R $GAME_USER:$GAME_USER "/home/$GAME_USER/.ssh"
+chmod 700 "/home/$GAME_USER/.ssh"
+chmod 600 "/home/$GAME_USER/.ssh/authorized_keys"
+
+# Preliminary requirements
+apt install -y curl wget sudo python3-venv
+
+if [ "$(get_enabled_firewall)" == "none" ]; then
+	install_ufw
+fi
+
+# Install steam binary and steamcmd
+install_steamcmd
+
+# Grab Proton from Glorious Eggroll
+install_proton "$PROTON_VERSION"
+
+############################################
+## Game Installation
+############################################
+
+if [ $OPT_FORCE_REINSTALL -eq 1 ]; then
+	echo "Force reinstalling Rust server..."
+	if [ -e "$GAME_DIR/RustDedicated_Data" ]; then
+		echo "Removing game data..."
+		rm -fr "$GAME_DIR/RustDedicated_Data"
+	fi
+	if [ -e "$GAME_DIR/steamapps" ]; then
+		echo "Removing Steam meta files..."
+		rm -fr "$GAME_DIR/steamapps"
+	fi
+fi
+
+# Admin pass, used for RCON
+ADMIN_PASS="$(random_password)"
+
+# Install Rust Dedicated Server
+if [ $RUNNING -eq 1 ]; then
+	echo "WARNING - Rust server is currently running, this script will not update the game files."
+	echo "Skipping steam update"
+else
+	sudo -u $GAME_USER /usr/games/steamcmd +force_install_dir $GAME_DIR +login anonymous +app_update $STEAM_ID validate +quit
+	if [ $? -ne 0 ]; then
+		echo "Could not install Rust Dedicated Server, exiting" >&2
+		exit 1
+	fi
+fi
+
+# Create the systemd service directory
+[ -e /etc/systemd/system/${RUST_SERVER}.service.d ] || mkdir -p /etc/systemd/system/${RUST_SERVER}.service.d
+
+# Install system service file
+cat > /etc/systemd/system/${RUST_SERVER}.service <<EOF
+[Unit]
+# DYNAMICALLY GENERATED FILE! Edit at your own risk
+Description=Rust Dedicated Server
+After=network.target
+After=rust-updater.service
+
+[Service]
+Type=simple
+LimitNOFILE=10000
+User=$GAME_USER
+Group=$GAME_USER
+WorkingDirectory=$GAME_DIR
+Environment=XDG_RUNTIME_DIR=/run/user/$(id -u)
+Environment="STEAM_COMPAT_CLIENT_INSTALL_PATH=$STEAM_DIR"
+Environment="STEAM_COMPAT_DATA_PATH=$GAME_DIR/prefix"
+Restart=on-failure
+RestartSec=20s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Create or update the service override
+if [ -e /etc/systemd/system/${RUST_SERVER}.service.d/override.conf ]; then
+	# Override exists, check if it needs upgraded
+	CURRENT_PROTON_BIN="$(grep ExecStart /etc/systemd/system/${RUST_SERVER}.service.d/override.conf | sed 's:^ExecStart=\([^ ]*\) .*:\1:')"
+	if [ "$CURRENT_PROTON_BIN" != "$PROTON_BIN" ]; then
+		echo "Upgrading Proton binary from $CURRENT_PROTON_BIN to $PROTON_BIN"
+		sed -i "s:^ExecStart=[^ ]*:ExecStart=$PROTON_BIN:" /etc/systemd/system/${RUST_SERVER}.service.d/override.conf
+	fi
+else
+	# Create boilerplate override file
+	cat > /etc/systemd/system/${RUST_SERVER}.service.d/override.conf <<EOF
+[Service]
+# Edit this line to adjust start parameters of the server
+# After modifying, please remember to run \`sudo systemctl daemon-reload\` to apply changes to the system.
+ExecStart=$PROTON_BIN run RustDedicated.exe -batchmode -nographics +server.hostname "${SERVERNAME}" +server.description "${SERVERDESC}" +server.port ${PORT_GAME} +server.maxplayers ${MAXPLAYERS} +server.worldsize ${WORLDSIZE} +server.seed $(shuf -i 1-2147483647 -n 1) +rcon.port ${PORT_RCON} +rcon.password ${ADMIN_PASS} +rcon.web 1 $([ $PVE_MODE -eq 1 ] && echo "+server.pve true" || echo "+server.pve false")
+EOF
+fi
+
+# Set the owner of the override to steam
+chown $GAME_USER:$GAME_USER /etc/systemd/system/${RUST_SERVER}.service.d/override.conf
+
+# Setup Proton prefix
+if [ $OPT_RESET_PROTON -eq 1 -a -e $GAME_DIR/prefix ]; then
+	echo "Resetting proton prefix"
+	rm $GAME_DIR/prefix -r
+fi
+
+if [ ! -e $GAME_DIR/prefix ]; then
+	echo "Creating Proton prefix..."
+	[ -d $GAME_DIR ] || sudo -u $GAME_USER mkdir -p $GAME_DIR
+	sudo -u $GAME_USER cp $GAME_COMPAT_DIR $GAME_DIR/prefix -r
+fi
+
+# Create updater service
+cat > /etc/systemd/system/rust-updater.service <<EOF
+[Unit]
+# DYNAMICALLY GENERATED FILE! Edit at your own risk
+Description=Rust Dedicated Server Updater
+After=network.target
+
+[Service]
+Type=oneshot
+User=$GAME_USER
+Group=$GAME_USER
+WorkingDirectory=$GAME_DIR
+Environment=XDG_RUNTIME_DIR=/run/user/$(id -u)
+ExecStart=$GAME_DIR/update.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Create update script
+cat > $GAME_DIR/update.sh <<EOF
+#!/bin/bash
+#
+# Update Rust Dedicated Server
+#
+# DYNAMICALLY GENERATED FILE! Edit at your own risk
+
+GAME_USER="$GAME_USER"
+GAME_DIR="$GAME_DIR"
+STEAM_ID="$STEAM_ID"
+RUST_SERVER="$RUST_SERVER"
+
+# This script is expected to be run as the steam user
+if [ "\$(whoami)" == "\$GAME_USER" ]; then
+	SUDO_NEEDED=0
+else
+	SUDO_NEEDED=1
+fi
+
+function update_game {
+	echo "Running game update"
+	if [ "\$SUDO_NEEDED" -eq 1 ]; then
+		sudo -u \$GAME_USER /usr/games/steamcmd +force_install_dir \$GAME_DIR +login anonymous +app_update \$STEAM_ID validate +quit
+	else
+		/usr/games/steamcmd +force_install_dir \$GAME_DIR +login anonymous +app_update \$STEAM_ID validate +quit
+	fi
+
+	if [ \$? -ne 0 ]; then
+		echo "Game update failed!" >&2
+		exit 1
+	fi
+}
+
+# Check if server is running
+if [ "\$(systemctl is-active \$RUST_SERVER)" == "active" ]; then
+	echo "WARNING - Rust server is still running"
+	echo "Do you still want to run updates? (y/N): "
+	read UP
+	if [ "\$UP" != "y" -a "\$UP" != "Y" ]; then
+		echo "Server is running, not updating"
+		exit 0
+	fi
+fi
+
+update_game
+EOF
+chown $GAME_USER:$GAME_USER $GAME_DIR/update.sh
+chmod +x $GAME_DIR/update.sh
+
+# Create start script
+cat > $GAME_DIR/start.sh <<EOF
+#!/bin/bash
+#
+# Start Rust server
+# DYNAMICALLY GENERATED FILE! Edit at your own risk
+
+RUST_SERVER="$RUST_SERVER"
+GAME_DIR="$GAME_DIR"
+
+function start_server {
+	echo "Starting Rust server..."
+	sudo systemctl start \$RUST_SERVER
+	echo "Waiting 30 seconds for server to start..."
+	sleep 30
+	sudo systemctl status \$RUST_SERVER | grep Active
+}
+
+function update_game {
+	echo "Running game update"
+	sudo -u $GAME_USER /usr/games/steamcmd +force_install_dir \$GAME_DIR +login anonymous +app_update $STEAM_ID validate +quit
+	if [ \$? -ne 0 ]; then
+		echo "Game update failed, not starting"
+		exit 1
+	fi
+}
+
+if [ "\$(systemctl is-active \$RUST_SERVER)" == "active" ]; then
+	echo "Server is already running"
+	exit 0
+fi
+
+if [ "\$(systemctl is-enabled \$RUST_SERVER)" == "enabled" ]; then
+	update_game
+	start_server
+else
+	echo "Server is not enabled, run: sudo systemctl enable \$RUST_SERVER"
+fi
+EOF
+chown $GAME_USER:$GAME_USER $GAME_DIR/start.sh
+chmod +x $GAME_DIR/start.sh
+
+# Create stop script
+cat > $GAME_DIR/stop.sh <<EOF
+#!/bin/bash
+#
+# Stop Rust server
+# DYNAMICALLY GENERATED FILE! Edit at your own risk
+
+RUST_SERVER="$RUST_SERVER"
+
+function stop_server {
+	echo "Stopping Rust server..."
+	sudo systemctl stop \$RUST_SERVER
+	echo "Waiting 10 seconds for server to stop..."
+	sleep 10
+	sudo systemctl status \$RUST_SERVER | grep Active
+}
+
+if [ "\$(systemctl is-active \$RUST_SERVER)" == "active" ]; then
+	stop_server
+else
+	echo "Server is not running"
+fi
+EOF
+chown $GAME_USER:$GAME_USER $GAME_DIR/stop.sh
+chmod +x $GAME_DIR/stop.sh
+
+# Create management script
+sudo -u $GAME_USER python3 -m venv $GAME_DIR/.venv
+sudo -u $GAME_USER $GAME_DIR/.venv/bin/pip install websocket-client
+
+cat > $GAME_DIR/manage.py <<EOF
+#!/usr/bin/env python3
+
+import os
+import sys
+import subprocess
+import json
+import websocket
+import time
+
+# Add venv to path
+here = os.path.dirname(os.path.realpath(__file__))
+if not os.path.exists(os.path.join(here, '.venv')):
+    print('Python environment not setup')
+    sys.exit(1)
+
+sys.path.insert(0, os.path.join(here, '.venv', 'lib', 'python' + '.'.join(sys.version.split('.')[:2]), 'site-packages'))
+
+# Require sudo / root to run this script
+if os.geteuid() != 0:
+    print("This script must be run as root")
+    sys.exit(1)
+
+RUST_SERVER = "$RUST_SERVER"
+GAME_DIR = "$GAME_DIR"
+
+class RustRCON:
+    def __init__(self, password, port=28016):
+        self.password = password
+        self.port = port
+        self.ws = None
+        
+    def connect(self):
+        try:
+            self.ws = websocket.WebSocket()
+            self.ws.connect(f"ws://localhost:{self.port}/{self.password}")
+            return True
+        except Exception as e:
+            print(f"Failed to connect to RCON: {e}")
+            return False
+            
+    def command(self, cmd):
+        if not self.ws:
+            return None
+        try:
+            message = {
+                "Identifier": int(time.time()),
+                "Message": cmd,
+                "Name": "WebRcon"
+            }
+            self.ws.send(json.dumps(message))
+            result = self.ws.recv()
+            return json.loads(result)
+        except Exception as e:
+            print(f"RCON command failed: {e}")
+            return None
+            
+    def close(self):
+        if self.ws:
+            self.ws.close()
+
+def is_running():
+    return subprocess.run(
+        ['systemctl', 'is-active', RUST_SERVER],
+        stdout=subprocess.PIPE
+    ).stdout.decode().strip() == 'active'
+
+def is_enabled():
+    return subprocess.run(
+        ['systemctl', 'is-enabled', RUST_SERVER],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False
+    ).stdout.decode().strip() == 'enabled'
+
+def get_rcon_password():
+    try:
+        with open(f'/etc/systemd/system/{RUST_SERVER}.service.d/override.conf', 'r') as f:
+            content = f.read()
+            for line in content.split('\n'):
+                if '+rcon.password' in line:
+                    return line.split('+rcon.password')[1].strip().split()[0]
+    except:
+        pass
+    return None
+
+def show_status():
+    print("=====================================")
+    print("         Rust Server Status")
+    print("=====================================")
+    print(f"Service: {'Running' if is_running() else 'Stopped'}")
+    print(f"Auto-start: {'Enabled' if is_enabled() else 'Disabled'}")
+    
+    if is_running():
+        password = get_rcon_password()
+        if password:
+            rcon = RustRCON(password)
+            if rcon.connect():
+                result = rcon.command("serverinfo")
+                if result and result.get('Message'):
+                    info = json.loads(result['Message'])
+                    print(f"Players: {info.get('Players', 'N/A')}/{info.get('MaxPlayers', 'N/A')}")
+                    print(f"Map: {info.get('Map', 'N/A')}")
+                    print(f"Version: {info.get('Version', 'N/A')}")
+                rcon.close()
+            else:
+                print("Players: N/A (RCON unavailable)")
+        else:
+            print("Players: N/A (RCON password not found)")
+    
+    print("")
+
+def main_menu():
+    while True:
+        os.system('clear' if os.name == 'posix' else 'cls')
+        show_status()
+        
+        options = []
+        running = is_running()
+        enabled = is_enabled()
+        
+        if enabled:
+            options.append("[D]isable auto-start")
+        else:
+            options.append("[E]nable auto-start")
+            
+        if running:
+            options.append("s[T]op server")
+            options.append("[R]estart server")
+        else:
+            options.append("[S]tart server")
+            
+        options.extend(["[U]pdate server", "[C]onfigure", "[Q]uit"])
+        
+        print(" | ".join(options))
+        choice = input(": ").lower()
+        
+        if choice == 'q':
+            break
+        elif choice == 'e' and not enabled:
+            subprocess.run(['systemctl', 'enable', RUST_SERVER])
+        elif choice == 'd' and enabled:
+            subprocess.run(['systemctl', 'disable', RUST_SERVER])
+        elif choice == 's' and not running:
+            subprocess.run(['systemctl', 'start', RUST_SERVER])
+        elif choice == 't' and running:
+            subprocess.run(['systemctl', 'stop', RUST_SERVER])
+        elif choice == 'r' and running:
+            subprocess.run(['systemctl', 'restart', RUST_SERVER])
+        elif choice == 'u':
+            if running:
+                print("Please stop the server before updating")
+                input("Press Enter to continue...")
+            else:
+                subprocess.run([os.path.join(GAME_DIR, 'update.sh')])
+                input("Press Enter to continue...")
+        elif choice == 'c':
+            configure_menu()
+
+def configure_menu():
+    while True:
+        os.system('clear' if os.name == 'posix' else 'cls')
+        print("=====================================")
+        print("      Configuration Menu")
+        print("=====================================")
+        print("")
+        
+        if is_running():
+            print("⚠️  Server is running - stop server to make changes")
+            input("Press Enter to go back...")
+            return
+            
+        print("[S]erver settings | [B]ack")
+        choice = input(": ").lower()
+        
+        if choice == 'b':
+            return
+        elif choice == 's':
+            edit_server_config()
+
+def edit_server_config():
+    config_file = f'/etc/systemd/system/{RUST_SERVER}.service.d/override.conf'
+    print(f"Opening {config_file} for editing...")
+    print("After making changes, run: sudo systemctl daemon-reload")
+    input("Press Enter to continue...")
+    subprocess.run(['nano', config_file])
+
+if __name__ == "__main__":
+    main_menu()
+EOF
+chown $GAME_USER:$GAME_USER $GAME_DIR/manage.py
+chmod +x $GAME_DIR/manage.py
+
+# Reload systemd
+systemctl daemon-reload
+systemctl enable rust-updater
+
+############################################
+## Security Configuration
+############################################
+
+firewall_allow --port "${PORT_GAME}" --udp --comment "Rust Game Port"
+firewall_allow --port "${PORT_RCON}" --tcp --comment "Rust RCON Port"
+firewall_allow --port "${PORT_QUERY}" --udp --comment "Rust Query Port"
+
+############################################
+## Post-Install Configuration
+############################################
+
+# Create some helpful links for the user
+[ -h "$GAME_DIR/service.conf" ] || sudo -u $GAME_USER ln -s /etc/systemd/system/${RUST_SERVER}.service.d/override.conf "$GAME_DIR/service.conf"
+
+# Create server.cfg if it doesn't exist
+if [ ! -e "$GAME_DIR/server.cfg" ]; then
+	sudo -u $GAME_USER cat > "$GAME_DIR/server.cfg" <<EOF
+# Rust Server Configuration File
+# This file can be used for additional server settings
+
+# Server identity (change this to something unique)
+server.identity "rust_server_$(date +%s)"
+
+# Additional server settings can be added here
+# For example:
+# server.radiation false
+# server.stability true
+# decay.scale 1.0
+EOF
+fi
+
+echo "================================================================================"
+echo "If everything went well, Rust Dedicated Server should be installed!"
+echo ""
+echo "Game files:            $GAME_DIR/"
+echo "Service configuration: $GAME_DIR/service.conf"
+echo "Server configuration:  $GAME_DIR/server.cfg"
+echo "RCON Password:         $ADMIN_PASS"
+echo "Game Port:             $PORT_GAME (UDP)"
+echo "RCON Port:             $PORT_RCON (TCP)"
+echo ""
+echo "Management commands:"
+echo "  Start server:    sudo systemctl start $RUST_SERVER"
+echo "  Stop server:     sudo systemctl stop $RUST_SERVER"
+echo "  Enable auto-start: sudo systemctl enable $RUST_SERVER"
+echo "  Server status:   sudo systemctl status $RUST_SERVER"
+echo "  Server logs:     sudo journalctl -u $RUST_SERVER -f"
+echo ""
+echo "Management script:     $GAME_DIR/manage.py"
+echo "Update script:         $GAME_DIR/update.sh"
+echo ""
+echo "To start the server now, run:"
+echo "  sudo systemctl enable $RUST_SERVER"
+echo "  sudo systemctl start $RUST_SERVER"
+echo ""
+echo "================================================================================"
